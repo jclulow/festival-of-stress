@@ -1,0 +1,15 @@
+[package]
+name = "stress"
+version = "0.0.0"
+edition = "2018"
+
+[dependencies]
+anyhow = "1"
+getopts = "0.2"
+jmclib = { git = "https://github.com/jclulow/rust-jmclib" }
+atty = "0.2"
+slog = "2.7"
+slog-term = "2.8"
+rand = "0.8"
+rand_chacha = "0.3"
+walkdir = "2.3"
