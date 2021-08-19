@@ -10,6 +10,7 @@ use std::io::{Read, Write, Seek};
 use rand::prelude::*;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use std::os::unix::io::AsRawFd;
 
 mod common;
 use common::*;
@@ -44,7 +45,15 @@ fn chown_to_me<P: AsRef<Path>>(p: P) -> Result<()> {
     Command::new("/bin/pfexec")
         .env_clear()
         .arg("/bin/chown")
+        .arg("-R")
         .arg("jclulow")
+        .arg(p.as_ref())
+        .output()?;
+    Command::new("/bin/pfexec")
+        .env_clear()
+        .arg("/bin/chmod")
+        .arg("-R")
+        .arg("u+rwx")
         .arg(p.as_ref())
         .output()?;
     Ok(())
@@ -161,6 +170,45 @@ fn file_futz<P: AsRef<Path>, T: rand::Rng>(p: P, rng: &mut T,
 
     let sz = f.metadata()?.len();
 
+    if sz < 2048 {
+        /*
+         * Small file found.  Pad it out to meet our expectations.
+         */
+        let sz_mb = rng.gen_range::<u64, _>(FILE_MIN..=FILE_MAX);
+
+        let f = fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .create(true)
+            .open(p.as_ref())?;
+        let mut bw = io::BufWriter::new(f);
+
+        /*
+         * Create a file with random data:
+         */
+        let mut buf = Vec::with_capacity(8192);
+        for _ in 0..(sz_mb * 64) {
+            buf.clear();
+
+            /*
+             * Generate mostly random data, with some compressible data:
+             */
+            let random = rng.gen_bool(0.75);
+
+            while buf.len() < (16 * KILOBYTE) as usize {
+                if random {
+                    buf.push(rng.gen::<u8>());
+                } else {
+                    buf.push(b'A');
+                }
+            }
+
+            bw.write(&buf)?;
+        }
+
+        return Ok(());
+    }
+
     /*
      * Determine how many operations we will perform on this
      * file.
@@ -195,6 +243,11 @@ fn file_futz<P: AsRef<Path>, T: rand::Rng>(p: P, rng: &mut T,
 
             f.write_all(buf)?;
             f.flush()?;
+
+            if rng.gen_bool(0.30) {
+                unsafe { libc::fsync(f.as_raw_fd()) }; /* XXX */
+            }
+
         } else {
             f.read_exact(buf)?;
         }
@@ -214,18 +267,21 @@ impl Plant {
         /*
          * Clone the seed:
          */
-        zfs_clone(&log, parent, "final", &dataset)?;
+        zfs_clone(&log, parent, /* XXX "final" */ "20130419223617", &dataset)?;
 
         let mountpoint = PathBuf::from(zfs_get(&log, &dataset, "mountpoint")?);
         chown_to_me(&mountpoint)?;
 
-        Ok(Plant {
+        let plant = Plant {
             log,
             id,
             parent: parent.to_string(),
             mountpoint,
             dataset,
-        })
+        };
+
+        plant.start(4).ok(); /* XXX */
+        Ok(plant)
     }
 
     fn start(&self, nthreads: u64) -> Result<()> {
@@ -323,7 +379,7 @@ fn main() -> Result<()> {
             /*
              * Prepare seed datasets:
              */
-            let seeds = (0..10u64).map(|id| {
+            let seeds = (0..4u64).map(|id| {
                 let log = log.new(o! { "seed" => id });
 
                 info!(log, "creating seed {}", id);
@@ -344,8 +400,9 @@ fn main() -> Result<()> {
             let plants = (0..PLANT_COUNT).map(|id| {
                 let log = log.new(o! { "plant" => id });
 
-                let si = rng.gen_range(0..seeds.len());
-                let seed = seeds[si].dataset().to_string();
+                let seed = "dynamite/joyent/base64-13.1.0";
+                // let si = rng.gen_range(0..seeds.len());
+                //let seed = seeds[si].dataset().to_string();
                 info!(log, "creating plant {} from {}", id, seed);
 
                 Plant::setup(log.clone(), "dynamite", id, &seed)
@@ -354,9 +411,9 @@ fn main() -> Result<()> {
             /*
              * Start all the I/O threads:
              */
-            for p in &plants {
-                p.start(4)?;
-            }
+            //for p in &plants {
+            //    p.start(4)?;
+            //}
 
             loop {
                 /*
@@ -376,7 +433,7 @@ fn main() -> Result<()> {
              *        zfs send of the current snapshot using the second most
              *        recent snapshot as the comparison base
              */
-            let maxsnaps = 5;
+            let maxsnaps = 6;
             loop {
                 let snapnum = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -408,11 +465,6 @@ fn main() -> Result<()> {
                             };
 
                             /*
-                             * Take snapshot.
-                             */
-                            zfs_snapshot(&log, &ds, &snapname, false)?;
-
-                            /*
                              * Age out old snapshots.
                              */
                             let snaps = loop {
@@ -424,6 +476,11 @@ fn main() -> Result<()> {
 
                                 zfs_destroy_snapshot(&log, &ds, &snaps[0])?;
                             };
+
+                            /*
+                             * Take snapshot.
+                             */
+                            zfs_snapshot(&log, &ds, &snapname, false)?;
 
                             if snaps.len() < 2 {
                                 continue;
@@ -441,7 +498,7 @@ fn main() -> Result<()> {
                     t.join().unwrap()?;
                 }
 
-                sleep(5_000);
+                sleep(60_000);
             }
         }
         n => {

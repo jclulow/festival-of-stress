@@ -267,6 +267,7 @@ dependencies = [
  "atty",
  "getopts",
  "jmclib",
+ "libc",
  "rand",
  "rand_chacha",
  "slog",
