@@ -1,5 +1,3 @@
-#![feature(command_access)]
-
 use std::process::Command;
 use super::common::*;
 
@@ -188,7 +186,7 @@ pub fn zfs_get(log: &Logger, dataset: &str, prop: &str) -> Result<String> {
         bail!("{:?} failed: {}", cmd.get_args(), res.info());
     }
 
-    Ok(String::from_utf8(res.stdout)?.trim_right_matches('\n').to_string())
+    Ok(String::from_utf8(res.stdout)?.trim_end_matches('\n').to_string())
 }
 
 pub fn zfs_snapshot_exists(log: &Logger, dataset: &str, snapname: &str)

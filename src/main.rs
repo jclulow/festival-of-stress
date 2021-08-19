@@ -35,6 +35,8 @@ const SEED_FILE_COUNT: usize = 1_000;
 const FILE_MIN: u64 = 2; /* MB */
 const FILE_MAX: u64 = 32; /* MB */
 
+const PLANT_COUNT: u64 = 60;
+
 fn chown_to_me<P: AsRef<Path>>(p: P) -> Result<()> {
     /*
      * Fix permissions so we can write to the directory.
@@ -86,7 +88,7 @@ impl Seed {
 
                 let sz_mb = rng.gen_range::<u64, _>(FILE_MIN..=FILE_MAX);
 
-                let mut f = fs::OpenOptions::new()
+                let f = fs::OpenOptions::new()
                     .write(true)
                     .truncate(true)
                     .create(true)
@@ -295,165 +297,7 @@ impl Plant {
     }
 }
 
-/*
- * Define a work area under the pool; e.g.,
- *  dynamite/0001/base
- *               /clone0a (from base@snap0)
- *               /clone0b (from base@snap0)
- *               /clone1a (from base@snap1)
- *          /0002/base
- *          ...
- */
-struct Worker {
-    log: Logger,
-    pool: String,
-    id: u64,
-}
-
-impl Worker {
-    fn new(log: Logger, pool: &str, id: u64) -> Result<Worker> {
-        Ok(Worker {
-            log,
-            pool: pool.to_string(),
-            id,
-        })
-    }
-
-    fn run(&mut self) -> Result<()> {
-        let log = &self.log;
-        let mut rng = rand_chacha::ChaCha20Rng::from_entropy();
-
-        let root = format!("{}/{:<04}", self.pool, self.id);
-
-        /*
-         * First, recursively destroy the dataset.
-         */
-        zfs_destroy(log, &root, true)?;
-
-        /*
-         * Now, create the container dataset and the base dataset beneath.
-         */
-        zfs_create(log, &root, false)?;
-        let base = format!("{}/base", root);
-        zfs_create(log, &base, false)?;
-
-        /*
-         * Create some random data in the base dataset.
-         */
-        let mp = PathBuf::from(zfs_get(log, &base, "mountpoint")?);
-        let mut base_num = 0;
-        let base_steps = 2;
-        let snap_count = 4;
-        let file_count = 32;
-        let file_megs = 16;
-
-        /*
-         * Fix permissions so we can write to the directory.
-         */
-        chown_to_me(&mp)?;
-
-        for snap in 0..snap_count {
-            /*
-             * Before and between snapshots, write some new data.
-             */
-            for l0 in base_num..(base_num + base_steps) {
-                let mut dir0 = mp.clone();
-                dir0.push(format!("{:<02}", l0));
-
-                for l1 in 0..base_steps {
-                    let mut dir1 = dir0.clone();
-                    dir1.push(format!("{:<02}", l1));
-
-                    fs::create_dir_all(&dir1)?;
-
-                    for l2 in 0..file_count {
-                        let mut file = dir1.clone();
-                        file.push(format!("{:<04}.dat", l2));
-
-                        let mut f = fs::OpenOptions::new()
-                            .write(true)
-                            .truncate(true)
-                            .create(true)
-                            .open(&file)?;
-                        let mut bw = io::BufWriter::new(f);
-
-                        /*
-                         * Create a file with random data:
-                         */
-                        for _ in 0..(file_megs * 1024) {
-                            let mut buf = Vec::new();
-
-                            /*
-                             * Create a random kilobyte of data:
-                             */
-                            while buf.len() < 1024 {
-                                buf.push(rng.gen::<u8>());
-                            }
-                            bw.write(&buf)?;
-                        }
-
-                        bw.flush()?;
-                    }
-                }
-            }
-
-            /*
-             * Overwrite some, but not all, of the data between snapshots.
-             */
-            base_num += base_steps / 2;
-
-            /*
-             * Create a snapshot of the base dataset so that we can clone it.
-             */
-            let snapname = format!("snap{:<02}", snap);
-            zfs_snapshot(log, &base, &snapname, false)?;
-
-            /*
-             * Create four clones of each snapshot.
-             */
-            for clone in 'a'..='d' {
-                let clone = format!("{}/clone{}{}", root, snap, clone);
-
-                zfs_clone(log, &base, &snapname, &clone)?;
-
-                /*
-                 * Read the data back from each clone.
-                 */
-                let mp = PathBuf::from(zfs_get(log, &clone, "mountpoint")?);
-                for l0 in 0..(snap_count * base_steps) {
-                    let mut dir0 = mp.clone();
-                    dir0.push(format!("{:<02}", l0));
-
-                    for l1 in 0..base_steps {
-                        let mut dir1 = dir0.clone();
-                        dir1.push(format!("{:<02}", l1));
-
-                        for l2 in 0..=file_count {
-                            let mut file = dir1.clone();
-                            file.push(format!("{:<04}.dat", l2));
-
-                            /*
-                             * Skip files that we cannot open.
-                             */
-                            if let Ok(mut f) = fs::OpenOptions::new()
-                                .read(true)
-                                .open(&file)
-                            {
-                                debug!(log, "reading back {:?}", file);
-                                let mut br = io::BufReader::new(f);
-                                let mut buf = Vec::new();
-                                br.read_to_end(&mut buf)?;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-}
-
+#[allow(dead_code)]
 fn jobs() -> Result<usize> {
     let out = Command::new("/usr/sbin/psrinfo")
         .env_clear()
@@ -497,7 +341,7 @@ fn main() -> Result<()> {
              * Establish plants, each from a random seed:
              */
             let mut rng = rand_chacha::ChaCha20Rng::from_entropy();
-            let plants = (0..60).map(|id| {
+            let plants = (0..PLANT_COUNT).map(|id| {
                 let log = log.new(o! { "plant" => id });
 
                 let si = rng.gen_range(0..seeds.len());
@@ -538,55 +382,55 @@ fn main() -> Result<()> {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
                     .as_secs();
-                let snapname = format!("backup-{}", snapnum);
 
-                let mut sends = Arc::new(Mutex::new(Vec::new()));
+                let datasets = Arc::new(Mutex::new(
+                    zfs_dataset_children(&log, "dynamite/plant")?));
 
-                for ds in zfs_dataset_children(&log, "dynamite/plant")? {
-                    /*
-                     * Take snapshot.
-                     */
-                    zfs_snapshot(&log, &ds, &snapname, false)?;
-
-                    /*
-                     * Age out old snapshots.
-                     */
-                    let snaps = loop {
-                        let snaps = zfs_snapshot_list(&log, &ds)?;
-
-                        if snaps.len() < maxsnaps {
-                            break snaps;
-                        }
-
-                        zfs_destroy_snapshot(&log, &ds, &snaps[0])?;
-                    };
-
-                    if snaps.len() < 2 {
-                        continue;
-                    }
-
-                    let sold = snaps[snaps.len() - 2].to_string();
-                    let snew = snaps[snaps.len() - 1].to_string();
-
-                    sends.lock().unwrap().push((ds, sold, snew));
-                    //zfs_send_to_null(&log, &ds, &sold, &snew)?;
-                }
+                //for ds in zfs_dataset_children(&log, "dynamite/plant")? {
+                //    //zfs_send_to_null(&log, &ds, &sold, &snew)?;
+                //}
 
                 let mut threads = Vec::<thread::JoinHandle<Result<()>>>::new();
-                for _ in 0..4 {
+                for _ in 0..8 {
                     let log = log.clone();
-                    let sends = Arc::clone(&sends);
+                    let datasets = Arc::clone(&datasets);
+                    let snapname = format!("backup-{}", snapnum);
 
                     threads.push(thread::spawn(move || {
                         loop {
-                            let (ds, sold, snew) = {
-                                let mut sends = sends.lock().unwrap();
-                                if let Some(x) = sends.pop() {
+                            let ds = {
+                                let mut datasets = datasets.lock().unwrap();
+                                if let Some(x) = datasets.pop() {
                                     x
                                 } else {
                                     return Ok(());
                                 }
                             };
+
+                            /*
+                             * Take snapshot.
+                             */
+                            zfs_snapshot(&log, &ds, &snapname, false)?;
+
+                            /*
+                             * Age out old snapshots.
+                             */
+                            let snaps = loop {
+                                let snaps = zfs_snapshot_list(&log, &ds)?;
+
+                                if snaps.len() < maxsnaps {
+                                    break snaps;
+                                }
+
+                                zfs_destroy_snapshot(&log, &ds, &snaps[0])?;
+                            };
+
+                            if snaps.len() < 2 {
+                                continue;
+                            }
+
+                            let sold = snaps[snaps.len() - 2].to_string();
+                            let snew = snaps[snaps.len() - 1].to_string();
 
                             zfs_send_to_null(&log, &ds, &sold, &snew)?;
                         }
@@ -594,7 +438,7 @@ fn main() -> Result<()> {
                 }
 
                 while let Some(t) = threads.pop() {
-                    t.join().unwrap();
+                    t.join().unwrap()?;
                 }
 
                 sleep(5_000);
@@ -604,46 +448,4 @@ fn main() -> Result<()> {
             bail!("unknown command {}", n);
         }
     }
-}
-
-fn mainold() -> Result<()> {
-    let log = init_log();
-
-    info!(log, "stress");
-
-    let j = 8 * jobs()?;
-
-    for id in 0..j {
-        let log = log.new(o! { "worker" => id });
-
-        let mut w = Worker::new(log.clone(), "dynamite", id as u64)?;
-
-        let mut rng = rand_chacha::ChaCha20Rng::from_entropy();
-
-        thread::spawn(move || {
-            /*
-             * Random start delay.
-             */
-            sleep(rng.gen_range(0..30_000));
-
-            loop {
-                info!(log, "worker starting");
-                if let Err(e) = w.run() {
-                    error!(log, "worker failure: {:?}", e);
-                    sleep(1000);
-                }
-
-                /*
-                 * Random delay between cycles.
-                 */
-                sleep(rng.gen_range(0..30_000));
-            }
-        });
-    }
-
-    loop {
-        sleep(1000); /* XXX join threads */
-    }
-
-    Ok(())
 }
